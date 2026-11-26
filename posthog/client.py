@@ -20,6 +20,7 @@ from typing import (
     Dict,
     FrozenSet,
     List,
+    Literal,
     Mapping,
     NamedTuple,
     Optional,
@@ -953,17 +954,38 @@ class _Lane:
         with self._start_lock:
             self._start_locked()
 
-    def enqueue(self, msg) -> bool:
-        """Atomically admit and queue `msg`, starting the lane on its first event."""
-        with self._start_lock:
-            if self._closed or not self.available:
-                return False
-            self._start_locked()
-            try:
-                self.queue.put(msg, block=False)
-                return True
-            except Full:
-                return False
+    def enqueue(self, msg, mode="drop", timeout=None) -> bool:
+        """Wait outside the admission lock so close can interrupt blocked producers."""
+        deadline = (
+            time.monotonic() + timeout
+            if mode == "block" and timeout is not None
+            else None
+        )
+        while True:
+            with self._start_lock:
+                if self._closed or not self.available:
+                    return False
+                self._start_locked()
+                try:
+                    self.queue.put(msg, block=False)
+                    return True
+                except Full:
+                    if mode == "raise":
+                        raise
+                    if mode == "drop":
+                        return False
+
+            # Consumers signal not_full after removing an item. Retry admission
+            # under the lock because another producer or shutdown can win.
+            with self.queue.not_full:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                if not self.queue.not_full.wait_for(
+                    lambda: self._closed or self.queue._qsize() < self.queue.maxsize,
+                    remaining,
+                ):
+                    return False
 
     def run_sync_if_open(self, send) -> bool:
         """Run a synchronous send admitted before closure, and report whether it ran."""
@@ -985,6 +1007,9 @@ class _Lane:
         """Terminal: atomically refuse all future queue and sync admissions."""
         with self._start_lock:
             self._closed = True
+            if self.available:
+                with self.queue.not_full:
+                    self.queue.not_full.notify_all()
 
     def wait_for_sync_sends(self) -> None:
         """Wait for synchronous sends admitted before close to finish."""
@@ -1226,6 +1251,8 @@ class Client(object):
         email_request_timeout_seconds: float = 15,
         email_request_max_retries: int = 2,
         migrated_from: Optional[str] = None,
+        on_queue_full: Literal["drop", "block", "raise"] = "drop",
+        queue_full_block_timeout: Optional[float] = None,
     ):
         """
         Initialize a new PostHog client instance.
@@ -1239,6 +1266,14 @@ class Client(object):
                 API methods.
             max_queue_size: Maximum number of analytics events buffered before
                 upload. AI events use ``capture_ai_max_queue_size``.
+            on_queue_full: Policy for both asynchronous capture lanes. "drop"
+                (default) warns and drops the incoming event. "block" waits for
+                space. Shutdown wakes waiting callers and rejects new events.
+                "raise" raises queue.Full. Public capture methods log the error
+                and return None unless debug=True, which propagates it.
+            queue_full_block_timeout: Maximum seconds to wait in "block" mode
+                before warning and dropping. None waits indefinitely while the
+                lane is open. Synchronous sends and send=False bypass the queue.
             send: If False, queueing succeeds but events are not sent.
             on_error: Optional callback ``(error, batch)`` invoked when an upload
                 fails: by background consumers, or on the calling thread in
@@ -1543,6 +1578,17 @@ class Client(object):
         self.capture_ai_compression = _resolve_capture_ai_compression(
             capture_ai_compression
         )
+        if on_queue_full not in ("drop", "block", "raise"):
+            self.log.warning(
+                "Invalid on_queue_full %r, falling back to 'drop'", on_queue_full
+            )
+            on_queue_full = "drop"
+        if queue_full_block_timeout is not None and (
+            queue_full_block_timeout != 0 or isinstance(queue_full_block_timeout, bool)
+        ):
+            _positive_config_value("queue_full_block_timeout", queue_full_block_timeout)
+        self.on_queue_full = on_queue_full
+        self.queue_full_block_timeout = queue_full_block_timeout
         capture_ai_max_queue_size = _positive_config_value(
             "capture_ai_max_queue_size", capture_ai_max_queue_size, integer=True
         )
@@ -3348,7 +3394,7 @@ class Client(object):
             )
             return None
 
-        if lane.enqueue(msg):
+        if lane.enqueue(msg, self.on_queue_full, self.queue_full_block_timeout):
             self.log.debug("enqueued %s.", msg["event"])
             return sent_uuid
 

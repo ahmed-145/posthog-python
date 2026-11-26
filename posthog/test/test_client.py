@@ -9,6 +9,7 @@ import time
 import unittest
 import warnings
 from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor
+from queue import Full
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 from uuid import UUID, uuid4
@@ -56,6 +57,88 @@ pytestmark = [
         r"ignore:`send_feature_flags` is deprecated:DeprecationWarning"
     ),
 ]
+
+
+class TestQueueBackpressure(unittest.TestCase):
+    def client(self, **kwargs):
+        client = Client(
+            FAKE_TEST_API_KEY,
+            thread=0,
+            max_queue_size=1,
+            capture_ai_max_queue_size=1,
+            **kwargs,
+        )
+        self.addCleanup(client.shutdown)
+        return client
+
+    def test_drop_is_default(self):
+        client = self.client()
+        self.assertTrue(client.capture("first"))
+        with self.assertLogs("posthog", "WARNING") as logs:
+            self.assertIsNone(client.capture("second"))
+        self.assertIn(
+            "analytics lane queue is full (maxsize 1), dropping event second",
+            logs.output[-1],
+        )
+        self.assertEqual(client.queue.get_nowait()["event"], "first")
+
+    def test_invalid_policy_falls_back_to_drop(self):
+        with self.assertLogs("posthog", "WARNING") as logs:
+            client = self.client(on_queue_full="invalid")
+        self.assertIn("on_queue_full", logs.output[-1])
+        self.assertTrue(client.capture("first"))
+        with self.assertLogs("posthog", "WARNING"):
+            self.assertIsNone(client.capture("second"))
+
+    def test_block_timeout_drops(self):
+        client = self.client(on_queue_full="block", queue_full_block_timeout=0.02)
+        self.assertTrue(client.capture("first"))
+        start = time.monotonic()
+        with self.assertLogs("posthog", "WARNING") as logs:
+            self.assertIsNone(client.capture("second"))
+        self.assertGreaterEqual(time.monotonic() - start, 0.02)
+        self.assertIn("dropping event second", logs.output[-1])
+
+    @parameterized.expand([(True,), (False,)])
+    def test_raise_respects_debug_on_both_lanes(self, debug):
+        client = self.client(on_queue_full="raise", debug=debug)
+        for capture in (client.capture, client.capture_ai):
+            self.assertTrue(capture("first"))
+            if debug:
+                with self.assertRaises(Full):
+                    capture("second")
+            else:
+                with self.assertLogs("posthog", "ERROR"):
+                    self.assertIsNone(capture("second"))
+
+    @parameterized.expand([(True,), (False,)])
+    def test_block_until_space_or_close(self, close):
+        client = self.client(on_queue_full="block")
+        self.assertTrue(client.capture("first"))
+        waiting = threading.Event()
+        wait = client.queue.not_full.wait
+
+        def signal_wait(timeout=None):
+            waiting.set()
+            return wait(timeout)
+
+        with (
+            mock.patch.object(client.queue.not_full, "wait", side_effect=signal_wait),
+            ThreadPoolExecutor(1) as executor,
+        ):
+            producer = executor.submit(client.capture, "second")
+            try:
+                self.assertTrue(waiting.wait(2))
+                self.assertFalse(producer.done())
+                if close:
+                    client.shutdown()
+                    self.assertIsNone(producer.result(2))
+                else:
+                    self.assertEqual(client.queue.get_nowait()["event"], "first")
+                    self.assertTrue(producer.result(2))
+                    self.assertEqual(client.queue.get_nowait()["event"], "second")
+            finally:
+                client._analytics_lane.close()
 
 
 class TestClient(unittest.TestCase):

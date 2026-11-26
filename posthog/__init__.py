@@ -469,6 +469,10 @@ Attributes:
     max_queue_size: Maximum number of analytics events buffered before upload.
         ``None`` keeps the client default. AI events use
         ``capture_ai_max_queue_size``.
+    on_queue_full: Full queue policy for both capture lanes: "drop" (default),
+        "block", or "raise". See Client for debug and shutdown behavior.
+    queue_full_block_timeout: Seconds to wait for queue space in "block" mode.
+        None waits indefinitely while the lane is open.
     max_retries: Number of upload retries on both capture lanes. ``None`` keeps
         the client default.
     timeout: Seconds allowed for one analytics upload request. ``None`` keeps the
@@ -516,6 +520,8 @@ enable_full_ai_capture = False  # type: bool
 # Queue, retry and timeout settings for the global client's two capture lanes.
 # `None` keeps the client's own default.
 max_queue_size = None  # type: Optional[int]
+on_queue_full = None  # type: Optional[str]
+queue_full_block_timeout = None  # type: Optional[float]
 max_retries = None  # type: Optional[int]
 timeout = None  # type: Optional[float]
 capture_ai_max_queue_size = None  # type: Optional[int]
@@ -1532,6 +1538,8 @@ def setup() -> Client:
         configured_api_key = (project_api_key or "").strip() or (api_key or "").strip()
         capture_settings: Dict[str, Any] = {
             "max_queue_size": max_queue_size,
+            "on_queue_full": on_queue_full,
+            "queue_full_block_timeout": queue_full_block_timeout,
             "max_retries": max_retries,
             "timeout": timeout,
             "capture_ai_max_queue_size": capture_ai_max_queue_size,

@@ -73,6 +73,8 @@ CAPTURE_SETTINGS = (
     "max_retries",
     "timeout",
     "capture_ai_max_queue_size",
+    "on_queue_full",
+    "queue_full_block_timeout",
     "capture_ai_timeout",
 )
 
@@ -179,6 +181,8 @@ class TestModuleLevelSetup(unittest.TestCase):
     @parameterized.expand(
         [
             ("project_root", "/path/to/project"),
+            ("on_queue_full", "block"),
+            ("queue_full_block_timeout", 0.1),
             ("super_options", {"cookieless_mode": True}),
         ]
     )
