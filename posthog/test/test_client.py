@@ -3792,7 +3792,50 @@ class TestClient(unittest.TestCase):
             msg_uuid = client.capture("test event", distinct_id="distinct_id")
         # Make sure we are informed that the queue is at capacity
         self.assertIsNone(msg_uuid)
-        self.assertIn("dropping event", logs.output[0])
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn(
+            "analytics lane queue is full (maxsize 1), dropping event test event",
+            logs.records[0].getMessage(),
+        )
+
+    @parameterized.expand([("capture",), ("capture_ai",)])
+    def test_on_drop_observes_only_full_queue(self, method):
+        callback = mock.Mock()
+        client = Client(
+            FAKE_TEST_API_KEY,
+            max_queue_size=1,
+            capture_ai_max_queue_size=1,
+            thread=0,
+            on_drop=callback,
+        )
+        self.addCleanup(client.shutdown)
+        capture = getattr(client, method)
+        self.assertIsNotNone(capture("accepted", distinct_id="user"))
+        callback.assert_not_called()
+        for name in ("first drop", "second drop"):
+            self.assertIsNone(capture(name, distinct_id="user"))
+        self.assertEqual(callback.call_count, 2)
+        for call, name in zip(callback.call_args_list, ("first drop", "second drop")):
+            event, reason = call.args
+            self.assertEqual(
+                (event["event"], event["distinct_id"], reason),
+                (name, "user", "queue_full"),
+            )
+
+    def test_on_drop_error_does_not_break_capture(self):
+        callback = mock.Mock(side_effect=RuntimeError("callback failed"))
+        client = Client(
+            FAKE_TEST_API_KEY, max_queue_size=1, thread=0, on_drop=callback, debug=True
+        )
+        self.addCleanup(client.shutdown)
+        self.assertIsNotNone(client.capture("accepted"))
+        with self.assertLogs("posthog", level="WARNING") as logs:
+            self.assertIsNone(client.capture("dropped"))
+        self.assertIn("on_drop callback raised", logs.records[-1].getMessage())
+        client.queue.get_nowait()
+        client.queue.task_done()
+        self.assertIsNotNone(client.capture("later"))
+        callback.assert_called_once()
 
     def test_join_discards_queued_work_when_no_consumer_can_drain_it(self):
         client = Client(FAKE_TEST_API_KEY, thread=0)

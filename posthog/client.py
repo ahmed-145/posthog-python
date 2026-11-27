@@ -1174,6 +1174,7 @@ class Client(object):
         *,
         debug=False,
         max_queue_size=10000,
+        on_drop: Optional[Callable[[dict, str], None]] = None,
         send=True,
         on_error=None,
         flush_at=100,
@@ -1239,6 +1240,9 @@ class Client(object):
                 API methods.
             max_queue_size: Maximum number of analytics events buffered before
                 upload. AI events use ``capture_ai_max_queue_size``.
+            on_drop: Optional callback invoked on the caller's thread when either
+                capture queue is full. Receives the dropped event dict and the
+                reason "queue_full". Keep it fast and avoid capturing from it.
             send: If False, queueing succeeds but events are not sent.
             on_error: Optional callback ``(error, batch)`` invoked when an upload
                 fails: by background consumers, or on the calling thread in
@@ -1435,6 +1439,9 @@ class Client(object):
         # api_key: This should be the Team API Key (token), public
         self.api_key = (project_api_key or "").strip()
 
+        if on_drop is not None and not callable(on_drop):
+            raise TypeError("on_drop must be callable or None")
+        self.on_drop = on_drop
         self.on_error = on_error
         self.debug = debug
         self.send = send
@@ -3372,6 +3379,15 @@ class Client(object):
                 lane.queue.maxsize,
                 msg["event"],
             )
+            # posthog-go reports this drop only by returning ErrQueueFull, with no
+            # callback or log. This hook preserves the Python capture return value.
+            if self.on_drop is not None:
+                try:
+                    self.on_drop(msg, "queue_full")
+                except Exception:
+                    self.log.warning(
+                        "on_drop callback raised for a full queue", exc_info=True
+                    )
         return None
 
     @property

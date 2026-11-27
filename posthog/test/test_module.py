@@ -73,6 +73,7 @@ CAPTURE_SETTINGS = (
     "max_retries",
     "timeout",
     "capture_ai_max_queue_size",
+    "on_drop",
     "capture_ai_timeout",
 )
 
@@ -179,6 +180,7 @@ class TestModuleLevelSetup(unittest.TestCase):
     @parameterized.expand(
         [
             ("project_root", "/path/to/project"),
+            ("on_drop", mock.Mock()),
             ("super_options", {"cookieless_mode": True}),
         ]
     )
